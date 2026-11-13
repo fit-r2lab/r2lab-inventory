@@ -40,7 +40,7 @@ as an example to illustrate a typical workflow, let's assuming that
 - and we want to replace it with node 42, formerly in the preplab
 
 ```terminal
-cd r2lab-misc/inventory
+cd r2lab-inventory
 
 # always a good idea
 git pull

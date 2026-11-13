@@ -102,7 +102,7 @@ RHUBARBE_HEADER = """\
 # THIS FILE IS GENERATED - DO NOT EDIT BY HAND
 #
 # it is produced by 'inventory generate' and pushed by 'inventory publish'
-# the sources are boxes.yaml and positions.yaml in r2lab-misc/inventory
+# the sources are boxes.yaml and positions.yaml in this repo (r2lab-inventory)
 # any change made here will be overwritten at the next publish
 """
 
