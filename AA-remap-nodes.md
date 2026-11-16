@@ -14,25 +14,22 @@ The tools in this directory configure the testbed deployed on `faraday.inria.fr`
 
 * `dnsmasq`, that serves DHCP and DNS to the nodes, and
 * `rhubarbe`, that offers higher level tools for managing nodes status and images  
-  specifically the `publish` command will update `all_scope`, which affects the behaviour of `rhubarbe --all`
+  specifically the `install` command (see below) updates `all_scope`, which affects the behaviour of `rhubarbe --all`
 
 ### installation / requirements
 
 ```bash
-# install
-pip install -r requirements.txt
-
-# check you have write access
-inventory check-ssh
+# install (needs uv)
+uv sync
 
 # see overview
-inventory help
+uv run inventory help
 ```
 
 ## A typical session
 
 Everything should be doable through a single command `inventory`  
-Note that the source code is in r2lab_inventory.py, and `inventory` is just a symlink
+Note that the source code is in r2lab_inventory.py, and `inventory` is the script that `uv sync` installs from `pyproject.toml`; run it as `uv run inventory`, or activate `.venv`
 
 as an example to illustrate a typical workflow, let's assuming that
 
@@ -45,6 +42,9 @@ cd r2lab-inventory
 # always a good idea
 git pull
 
+# activate the venv - this can be done automatically for you with direnv
+source .venv/bin/activate
+
 # you can't move a node to a non-empty slot
 # so first free the slot, then fill it
 inventory move 27 preplab
@@ -56,20 +56,22 @@ inventory set-note 27 "broken CMC"
 # check what's expected to be in prod
 inventory list --prod
 
-# check what would be pushed, then do it
-inventory publish --dry-run
-inventory publish
+# check what will be generated
+inventory generate
 
-# do not forget to commit the changes into the repo, e.g.
+# then commit and push the changes into the repo, e.g.
 git add boxes.yaml
 git commit -m "replaced node 27 in slot 27 with node 42"
 git push
+# nothing else to do: run-updates on faraday and on the preplab
+# catches the push within 10 minutes, and calls deploy/update.sh,
+# that installs the files and restarts the services
 ```
 
 ---
 
 ***IMPORTANT NOTE about propagation***  
-the `publish` stage pushes a new configuration towards the DNS server; be aware that these changes may take several minutes to propagate, so please be patient
+the new configuration is applied by `run-updates` on each box, which runs every 10 minutes, and `dnsmasq` may take a bit longer to settle; so please be patient
 
 ---
 
@@ -95,7 +97,7 @@ where the destination is `prod:N`, `preplab` or `defunct`. The free-form note of
 
 It fails if the destination slot is busy; so to replace the node in slot 27, first move it out of the way (to `preplab` or `defunct`), and then move the new one in. It also fails on a duplicate slot or MAC, and `list` / `generate` warn about empty prod slots.
 
-### `generate` and `publish`
+### `generate` and `install`
 
 ```bash
 inventory generate [--prod|--prep]
@@ -114,22 +116,14 @@ WARNING: empty prod slots: 04 06 13 15 17
 The warning lists the prod slots that no node is deployed in.
 
 ```bash
-inventory publish [--prod|--prep] [--dry-run]
+inventory install --prod|--prep [--root DIR]
 ```
 
-does a `generate`, then pushes the files to the gateway (`faraday` or the preplab), and restarts `NetworkManager` there, which is what runs `dnsmasq`; without `--prod` or `--prep` it does both. It also updates `all_scope` in `/etc/rhubarbe/rhubarbe.conf.local` on the gateway, to reflect the nodes that are actually there: for faraday that is `all_scope=1-37,~4,~6` where the `~` ones are the empty slots, and for the preplab the list of nodes that sit there.
+does a `generate`, then installs the files **on the box where it runs**: `/etc/rhubarbe/inventory-*.yaml` (the phones, pdus and relays ones only for prod, these being copies of `inventory-{phones,pdus,relays}.yaml` with a warning header), the `dnsmasq` configuration and `/etc/hosts`. It also updates `all_scope` in `/etc/rhubarbe/rhubarbe.conf.local`, to reflect the nodes that are actually there: for faraday that is `all_scope=1-37,~4,~6` where the `~` ones are the empty slots, and for the preplab the list of nodes that sit there.
 
-With `--dry-run` nothing is pushed, but the commands are shown instead, ready to cut and paste; so if you need to push only some pieces, run in dry mode and pick the commands you need:
+It restarts nothing, and it is not meant to be run by hand: it is called by `deploy/update.sh`, that `run-updates` runs after each push. That script figures out whether it is on prod or on the preplab (prod is where `monitorphones` and `monitorpdus` are enabled), runs `inventory install`, and then restarts `NetworkManager` (which is what runs `dnsmasq`) and the `rhubarbe` services that are enabled. Everything is recomputed and restarted every time, on purpose, to keep things simple.
 
-```terminal
-$ inventory publish --prod --dry-run
-<snip>
-# prod (dry run)
-rsync -vrltp prod-inventory-nodes.yaml root@faraday.inria.fr:/etc/rhubarbe/inventory-nodes.yaml
-rsync -rltp prod-dnsmasq root@faraday.inria.fr:/etc/NetworkManager/dnsmasq.d/03-testbed.conf
-rsync -rltp prod-hosts root@faraday.inria.fr:/etc/hosts
-ssh root@faraday.inria.fr 'systemctl restart NetworkManager'
-```
+`--root` installs under another directory instead of `/`, for testing.
 
 ### more subcommands
 
@@ -179,5 +173,5 @@ the key `static`, in the entry of that slot in the generated `*-inventory-nodes.
 numbers are checked. The file is optional, and it does not apply to the preplab, where
 nodes are exposed by physical number.
 
-***Careful when you first publish a `static` entry***: the `rhubarbe` on the gateway
+***Careful when you first push a `static` entry***: the `rhubarbe` on the gateway
 needs to be recent enough to ignore it, or it will fail on the inventory.

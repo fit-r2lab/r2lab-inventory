@@ -4,3 +4,5 @@ prep-*
 bak/
 prod/
 prep/
+.venv/
+*.egg-info/

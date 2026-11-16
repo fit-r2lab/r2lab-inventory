@@ -27,10 +27,9 @@ Subcommands
   set-note  set or remove the free-form note of a node
   generate  compute the config files (rhubarbe, dnsmasq, hosts, ...)
             for faraday and for the preplab; restrict with --prod or --prep
-  publish   generate, then push the config files to faraday and/or the preplab
-            and restart the services; --dry-run just shows the commands
-  check-ssh run a command, by default `rhubarbe version`, on the gateways
-            that publish talks to
+  install   generate, then install the config files on this box; this is
+            what deploy/update.sh runs on the target, after a push; it
+            does not restart anything
 
 Assumptions here:
 (*) node with physical number 33 has its CM card burned with
@@ -44,9 +43,9 @@ Assumptions here:
 import functools
 import os
 import re
-import shlex
-import subprocess
+import shutil
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -62,19 +61,13 @@ PROD_SLOTS = range(1, 38)
 PROD_PREFIX = "prod"
 PREP_PREFIX = "prep"
 
-PROD_GATEWAY = "root@faraday.inria.fr"
-PREP_GATEWAY = "root@preplab.pl.sophia.inria.fr"
-
-# where things go on the gateways
+# where things go on the box (the gateway of faraday or of the preplab)
 RHUBARBE_INVENTORY_DIR = "/etc/rhubarbe"
 RHUBARBE_INVENTORY = f"{RHUBARBE_INVENTORY_DIR}/inventory-nodes.yaml"
 # xxx the one on faraday is assumed to be the same as on the preplab
 RHUBARBE_CONF = "/etc/rhubarbe/rhubarbe.conf.local"
 DNSMASQ_CONF = "/etc/NetworkManager/dnsmasq.d/03-testbed.conf"
 HOSTS_CONF = "/etc/hosts"
-
-# around the shell commands that a dry run displays
-DELIMITER = 6 * "="
 
 # where the slots are in the room, as seen on the livemap; None for the places
 # that are not slots, like the two grey squares and the notch in the wall
@@ -104,16 +97,16 @@ INVENTORY_HEADER = """\
 RHUBARBE_HEADER = """\
 # THIS FILE IS GENERATED - DO NOT EDIT BY HAND
 #
-# it is produced by 'inventory generate' and pushed by 'inventory publish'
+# it is produced by 'inventory generate' and installed by 'inventory install'
 # the sources are boxes.yaml and positions.yaml in this repo (r2lab-inventory)
-# any change made here will be overwritten at the next publish
+# any change made here will be overwritten at the next update
 """
 
 COPY_HEADER = """\
 # THIS FILE IS GENERATED - DO NOT EDIT BY HAND
 #
-# it is a copy of inventory-{name}.yaml in the r2lab-inventory repo, pushed by 'inventory publish'
-# any change made here will be overwritten at the next publish
+# it is a copy of inventory-{name}.yaml in the r2lab-inventory repo, installed by 'inventory install'
+# any change made here will be overwritten at the next update
 #
 """
 
@@ -593,41 +586,47 @@ def parse_destination(text):
         f"{PROD_SLOTS.start}..{PROD_SLOTS.stop - 1}, preplab or defunct")
 
 
-def shell_join(argv):
-    "like shlex.join, but prefers double quotes over escaping single quotes"
-    def quote(arg):
-        if "'" in arg and not any(char in arg for char in '"$`\\!'):
-            return f'"{arg}"'
-        return shlex.quote(arg)
-    return " ".join(quote(arg) for arg in argv)
-
-
-def publish_commands(inventory, prep_lab):
+def install_files(inventory, prep_lab, source_prefix, root):
     """
-    the commands, as argv lists, that push the files computed by generate
-    to the gateway of faraday, or of the preplab
+    install on the local box the files computed by generate, which are
+    named after source_prefix; in particular this does not restart anything,
+    that is up to deploy/update.sh
+    root is normally '/', it is only changed for testing
     """
-    prefix, gateway, scope = (
-        (PREP_PREFIX, PREP_GATEWAY, inventory.spare_nodes()) if prep_lab else
-        (PROD_PREFIX, PROD_GATEWAY, inventory.prod_scope()))
+    root = Path(root)
+    scope = inventory.spare_nodes() if prep_lab else inventory.prod_scope()
+
+    def install(source, destination):
+        target = root / str(destination).lstrip("/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # atomic, so that e.g. /etc/hosts is never seen half-written
+        temporary = target.with_name(target.name + ".new")
+        shutil.copyfile(source, temporary)
+        temporary.chmod(0o644)
+        os.replace(temporary, target)
+        print(f"installed {target}")
+
+    install(f"{source_prefix}-inventory-nodes.yaml", RHUBARBE_INVENTORY)
+    if not prep_lab:
+        for name in PROD_COPIES:
+            install(f"{source_prefix}-inventory-{name}.yaml",
+                    f"{RHUBARBE_INVENTORY_DIR}/inventory-{name}.yaml")
+    install(f"{source_prefix}-dnsmasq", DNSMASQ_CONF)
+    install(f"{source_prefix}-hosts", HOSTS_CONF)
+
     # reflect the actual nodes in the scope of rhubarbe -a
     # this also converts the older all_scope.<hostname> form
-    sed = f"s/^all_scope[.=].*/all_scope={scope}/"
-    copies = [] if prep_lab else [
-        ["rsync", "-rltp", f"{prefix}-inventory-{name}.yaml",
-         f"{gateway}:{RHUBARBE_INVENTORY_DIR}/inventory-{name}.yaml"]
-        for name in PROD_COPIES]
-    return [
-        ["rsync", "-vrltp", f"{prefix}-inventory-nodes.yaml", f"{gateway}:{RHUBARBE_INVENTORY}"],
-        *copies,
-        ["rsync", "-rltp", f"{prefix}-dnsmasq", f"{gateway}:{DNSMASQ_CONF}"],
-        ["rsync", "-rltp", f"{prefix}-hosts", f"{gateway}:{HOSTS_CONF}"],
-        # restarting also cleans up the leases file; otherwise the new node
-        # may need to wait for some time before it gets served its address
-        # and could get stuff like 192.168.3.251 instead
-        ["ssh", gateway, "systemctl restart NetworkManager"],
-        ["ssh", gateway, f"sed -i -e '{sed}' {RHUBARBE_CONF}"],
-    ]
+    conf = root / RHUBARBE_CONF.lstrip("/")
+    try:
+        text = conf.read_text()
+    except OSError as exc:
+        raise InventoryError(f"{conf}: {exc}") from exc
+    text, count = re.subn(r"^all_scope[.=].*$", f"all_scope={scope}", text,
+                          flags=re.MULTILINE)
+    if count == 0:
+        raise InventoryError(f"{conf}: no all_scope line to update")
+    conf.write_text(text)
+    print(f"updated all_scope={scope} in {conf}")
 
 
 def get_node(inventory, phy):
@@ -639,7 +638,7 @@ def get_node(inventory, phy):
 
 class OrderedGroup(click.Group):
     "list the subcommands in --help in this order, not alphabetically"
-    ORDER = ("list", "move", "set-note", "generate", "check-ssh", "publish")
+    ORDER = ("list", "move", "set-note", "generate", "install")
 
     def list_commands(self, ctx):
         known = [name for name in self.ORDER if name in self.commands]
@@ -684,8 +683,6 @@ def run(func):
             return func(*args, **kwargs)
         except InventoryError as exc:
             raise click.ClickException(str(exc)) from exc
-        except subprocess.CalledProcessError as exc:
-            raise click.ClickException(f"failed: {shell_join(exc.cmd)}") from exc
     return wrapper
 
 
@@ -803,70 +800,30 @@ def generate(inventory, prod, prep):
 
 
 @main.command()
-@click.option("--prod", is_flag=True, help="only for faraday")
-@click.option("--prep", is_flag=True, help="only for the preplab")
-@click.option("-n", "--dry-run", is_flag=True,
-              help="do not push anything, just show the commands, ready to cut and paste")
+@click.option("--prod", is_flag=True, help="install the prod (faraday) files")
+@click.option("--prep", is_flag=True, help="install the preplab files")
+@click.option("--root", default="/", show_default=True,
+              type=click.Path(file_okay=False),
+              help="install under this directory instead of /, for testing")
 @click.pass_obj
 @run
-def publish(inventory, prod, prep, dry_run):
-    """Generate the config files, push them, and restart the services.
+def install(inventory, prod, prep, root):
+    """Generate the config files and install them on this box.
 
-    For both prod and prep unless restricted. The prod inventory-nodes.yaml
-    depends on positions.yaml as well as on boxes.yaml. The config files are always
-    computed locally; with --dry-run that is all that happens, and the
-    commands that would push them are shown instead of being run.
+    Exactly one of --prod and --prep is required; this is what
+    deploy/update.sh calls on the target box, after it has figured out
+    which one it is. All files are always rewritten. No service
+    is restarted here, that is deploy/update.sh's job.
     """
-    both = not (prod or prep)
-    for prep_lab in (False, True):
-        if not (prep if prep_lab else prod) and not both:
-            continue
-        name = "prep" if prep_lab else "prod"
-        if not prep_lab:
-            inventory.warn_empty_slots()
-        inventory.generate(prep_lab, PREP_PREFIX if prep_lab else PROD_PREFIX)
-        print(f"# {name}{' (dry run)' if dry_run else ''}")
-        if dry_run:
-            print(DELIMITER)
-        for argv in publish_commands(inventory, prep_lab):
-            if dry_run:
-                print(shell_join(argv))
-            else:
-                print(f"$ {shell_join(argv)}", flush=True)
-                subprocess.run(argv, check=True)
-        if dry_run:
-            print(DELIMITER)
-
-
-@main.command(name="check-ssh", context_settings={'ignore_unknown_options': True})
-@click.option("--prod", is_flag=True, help="only faraday")
-@click.option("--prep", is_flag=True, help="only the preplab")
-@click.option("-n", "--dry-run", is_flag=True, help="just show the commands")
-@click.argument("command", nargs=-1, type=click.UNPROCESSED)
-@click.pass_obj
-@run
-def check_ssh(inventory, prod, prep, dry_run, command):
-    """Run COMMAND on the gateways that publish talks to.
-
-    By default this is rhubarbe version; so it can be used to check
-    that ssh access works, before publishing. Options come first.
-    """
-    del inventory
-    remote = " ".join(command) or "rhubarbe version"
-    both = not (prod or prep)
-    failures = []
-    for gateway, wanted in ((PROD_GATEWAY, prod), (PREP_GATEWAY, prep)):
-        if not (wanted or both):
-            continue
-        argv = ["ssh", gateway, remote]
-        if dry_run:
-            print(shell_join(argv))
-            continue
-        print(f"$ {shell_join(argv)}", flush=True)
-        if subprocess.run(argv, check=False).returncode != 0:
-            failures.append(gateway)
-    if failures:
-        raise InventoryError("failed on " + " and ".join(failures))
+    if prod == prep:
+        raise InventoryError("install needs exactly one of --prod and --prep")
+    prep_lab = prep
+    if not prep_lab:
+        inventory.warn_empty_slots()
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix = os.path.join(tmp, PREP_PREFIX if prep_lab else PROD_PREFIX)
+        inventory.generate(prep_lab, prefix)
+        install_files(inventory, prep_lab, prefix, root)
 
 
 if __name__ == '__main__':

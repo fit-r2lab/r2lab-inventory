@@ -1,0 +1,21 @@
+[project]
+name = "r2lab-inventory"
+version = "0.1.0"
+description = "Where each R2Lab node sits, and the config files derived from that"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    'click',
+    'pyyaml',
+]
+
+# a single module, that offers the `inventory` command
+[project.scripts]
+inventory = "r2lab_inventory:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["r2lab_inventory"]
