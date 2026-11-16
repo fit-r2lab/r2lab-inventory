@@ -4,6 +4,7 @@ This subdir contains the tools to keep track of where each physical node sits
 (a slot in the prod testbed on `faraday`, the preplab, or defunct),
 and to generate the configuration of `dnsmasq` and `rhubarbe` from that.
 The data is in `boxes.yaml` (the hardware boxes and where they sit) and `positions.yaml` (what pertains to each slot of the testbed), and the tool is `inventory`.
+`inventory-phones.yaml`, `inventory-pdus.yaml` and `inventory-relays.yaml` are the sources of the other prod inventory files; they are pushed as-is (with a warning header) to faraday only.
 
 * [AA-where-to-change-what.excalidraw.svg](AA-where-to-change-what.excalidraw.svg): the sources of truth of the testbed and where to change what (figure below)
 * [AA-remap-nodes.md](AA-remap-nodes.md): how to move a node to another location

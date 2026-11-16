@@ -56,6 +56,8 @@ import yaml
 DEFAULT_INVENTORY = Path(__file__).resolve().parent / "boxes.yaml"
 POSITIONS_FILENAME = "positions.yaml"
 DEVICES_FILENAME = "devices.yaml"
+# source files that are copied as-is to prod, with a warning header
+PROD_COPIES = ("phones", "pdus", "relays")
 PROD_SLOTS = range(1, 38)
 PROD_PREFIX = "prod"
 PREP_PREFIX = "prep"
@@ -64,7 +66,8 @@ PROD_GATEWAY = "root@faraday.inria.fr"
 PREP_GATEWAY = "root@preplab.pl.sophia.inria.fr"
 
 # where things go on the gateways
-RHUBARBE_INVENTORY = "/etc/rhubarbe/inventory-nodes.yaml"
+RHUBARBE_INVENTORY_DIR = "/etc/rhubarbe"
+RHUBARBE_INVENTORY = f"{RHUBARBE_INVENTORY_DIR}/inventory-nodes.yaml"
 # xxx the one on faraday is assumed to be the same as on the preplab
 RHUBARBE_CONF = "/etc/rhubarbe/rhubarbe.conf.local"
 DNSMASQ_CONF = "/etc/NetworkManager/dnsmasq.d/03-testbed.conf"
@@ -104,6 +107,14 @@ RHUBARBE_HEADER = """\
 # it is produced by 'inventory generate' and pushed by 'inventory publish'
 # the sources are boxes.yaml and positions.yaml in this repo (r2lab-inventory)
 # any change made here will be overwritten at the next publish
+"""
+
+COPY_HEADER = """\
+# THIS FILE IS GENERATED - DO NOT EDIT BY HAND
+#
+# it is a copy of inventory-{name}.yaml in the r2lab-inventory repo, pushed by 'inventory publish'
+# any change made here will be overwritten at the next publish
+#
 """
 
 
@@ -530,10 +541,10 @@ class Inventory(dict):
         if not prep_lab:
             nodes.sort(key=lambda n: n.phy_num)
 
-        def write(out_filename, text, with_positions=False):
+        def write(out_filename, text, with_positions=False, source=None):
             with open(out_filename, 'w') as outfile:
                 outfile.write(text)
-            sources = os.path.relpath(self.filename)
+            sources = os.path.relpath(source or self.filename)
             if with_positions:
                 sources += f" and {os.path.relpath(self.positions_filename)}"
             # fixed width, so the names line up; 25 fits prep-inventory-nodes.yaml
@@ -544,6 +555,16 @@ class Inventory(dict):
         write(f"{prefix}-inventory-nodes.yaml", RHUBARBE_HEADER
               + yaml.safe_dump({'nodes': models}, sort_keys=True),
               with_positions=not prep_lab)
+        # phones, pdus and relays only exist in prod
+        if not prep_lab:
+            for name in PROD_COPIES:
+                source = Path(self.filename).parent / f"inventory-{name}.yaml"
+                try:
+                    content = source.read_text()
+                except OSError as exc:
+                    raise InventoryError(f"{source}: {exc}") from exc
+                write(f"{prefix}-inventory-{name}.yaml",
+                      COPY_HEADER.format(name=name) + content, source=source)
         devices = [d for d in self.devices if d.in_lab(prep_lab)]
         write(f"{prefix}-dnsmasq", DNSMASQ_HEADER
               + "\n### DEVICES (from devices.yaml)\n"
@@ -592,8 +613,13 @@ def publish_commands(inventory, prep_lab):
     # reflect the actual nodes in the scope of rhubarbe -a
     # this also converts the older all_scope.<hostname> form
     sed = f"s/^all_scope[.=].*/all_scope={scope}/"
+    copies = [] if prep_lab else [
+        ["rsync", "-rltp", f"{prefix}-inventory-{name}.yaml",
+         f"{gateway}:{RHUBARBE_INVENTORY_DIR}/inventory-{name}.yaml"]
+        for name in PROD_COPIES]
     return [
         ["rsync", "-vrltp", f"{prefix}-inventory-nodes.yaml", f"{gateway}:{RHUBARBE_INVENTORY}"],
+        *copies,
         ["rsync", "-rltp", f"{prefix}-dnsmasq", f"{gateway}:{DNSMASQ_CONF}"],
         ["rsync", "-rltp", f"{prefix}-hosts", f"{gateway}:{HOSTS_CONF}"],
         # restarting also cleans up the leases file; otherwise the new node

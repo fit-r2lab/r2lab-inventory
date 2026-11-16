@@ -2,3 +2,5 @@ prod-*
 prep-*
 .vscode
 bak/
+prod/
+prep/
